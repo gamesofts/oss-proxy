@@ -198,11 +198,10 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, bool, 
 		bucketInHost = true
 		if bucketName == "" {
 			first, rest, ok := splitBucketPath(path)
-			if !ok {
-				return nil, "", false, fmt.Errorf("missing bucket in path for bucket-in-host mode")
+			if ok {
+				bucketName = first
+				path = rest
 			}
-			bucketName = first
-			path = rest
 		} else {
 			path = stripLeadingBucket(path, bucketName)
 		}
