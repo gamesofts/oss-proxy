@@ -10,8 +10,28 @@
 - 可选设置 `OSS_FORCE_BUCKET`，将所有请求强制路由到同一 bucket
 - 可选 STS Token (`OSS_SECURITY_TOKEN`)
 - 可选 `OSS_SIGNATURE_VERSION` 指定签名版本：`v1`/`v4`/`auto`（默认 auto）
+- 支持通过 `OSS_CONFIG` 读取配置文件（JSON），环境变量会覆盖配置文件同名字段
 
 ## 运行
+
+```bash
+cat > oss-proxy.json <<'JSON'
+{
+  "listenAddr": ":8080",
+  "endpoint": "oss-cn-hangzhou.aliyuncs.com",
+  "region": "cn-hangzhou",
+  "accessKeyId": "your-ak",
+  "accessKeySecret": "your-sk",
+  "securityToken": "",
+  "forceBucket": "",
+  "insecureUpstream": false,
+  "signatureVersion": "auto"
+}
+JSON
+
+export OSS_CONFIG=oss-proxy.json
+# optional overrides
+```
 
 ```bash
 export OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com

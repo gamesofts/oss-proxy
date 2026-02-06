@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -19,37 +20,37 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	Endpoint         string
-	Region           string
-	AccessKeyID      string
-	AccessKeySecret  string
-	SecurityToken    string
-	ForceBucket      string
-	InsecureUpstream bool
-	SignatureVersion string
-}
-
-func mustEnv(key string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		log.Fatalf("missing required env: %s", key)
-	}
-	return v
+	ListenAddr       string `json:"listenAddr"`
+	Endpoint         string `json:"endpoint"`
+	Region           string `json:"region"`
+	AccessKeyID      string `json:"accessKeyId"`
+	AccessKeySecret  string `json:"accessKeySecret"`
+	SecurityToken    string `json:"securityToken"`
+	ForceBucket      string `json:"forceBucket"`
+	InsecureUpstream bool   `json:"insecureUpstream"`
+	SignatureVersion string `json:"signatureVersion"`
 }
 
 func loadConfig() Config {
-	endpoint := mustEnv("OSS_ENDPOINT")
 	cfg := Config{
-		ListenAddr:       getEnv("LISTEN_ADDR", ":8080"),
-		Endpoint:         endpoint,
-		Region:           getEnv("OSS_REGION", inferRegion(endpoint)),
-		AccessKeyID:      mustEnv("OSS_ACCESS_KEY_ID"),
-		AccessKeySecret:  mustEnv("OSS_ACCESS_KEY_SECRET"),
-		SecurityToken:    strings.TrimSpace(os.Getenv("OSS_SECURITY_TOKEN")),
-		ForceBucket:      strings.TrimSpace(os.Getenv("OSS_FORCE_BUCKET")),
-		InsecureUpstream: strings.EqualFold(strings.TrimSpace(os.Getenv("OSS_INSECURE_UPSTREAM")), "true"),
-		SignatureVersion: strings.ToLower(strings.TrimSpace(getEnv("OSS_SIGNATURE_VERSION", "auto"))),
+		ListenAddr:       ":8080",
+		SignatureVersion: "auto",
+	}
+	loadConfigFile(&cfg)
+
+	overrideFromEnv(&cfg)
+
+	if cfg.Endpoint == "" {
+		log.Fatalf("missing required config: OSS_ENDPOINT")
+	}
+	if cfg.AccessKeyID == "" {
+		log.Fatalf("missing required config: OSS_ACCESS_KEY_ID")
+	}
+	if cfg.AccessKeySecret == "" {
+		log.Fatalf("missing required config: OSS_ACCESS_KEY_SECRET")
+	}
+	if cfg.Region == "" {
+		cfg.Region = inferRegion(cfg.Endpoint)
 	}
 	return cfg
 }
@@ -60,6 +61,50 @@ func getEnv(key, def string) string {
 		return def
 	}
 	return v
+}
+
+func loadConfigFile(cfg *Config) {
+	path := strings.TrimSpace(os.Getenv("OSS_CONFIG"))
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("failed to read OSS_CONFIG: %v", err)
+	}
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		log.Fatalf("failed to parse OSS_CONFIG: %v", err)
+	}
+}
+
+func overrideFromEnv(cfg *Config) {
+	if v := strings.TrimSpace(os.Getenv("LISTEN_ADDR")); v != "" {
+		cfg.ListenAddr = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_ENDPOINT")); v != "" {
+		cfg.Endpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_REGION")); v != "" {
+		cfg.Region = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_ID")); v != "" {
+		cfg.AccessKeyID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_SECRET")); v != "" {
+		cfg.AccessKeySecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_SECURITY_TOKEN")); v != "" {
+		cfg.SecurityToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_FORCE_BUCKET")); v != "" {
+		cfg.ForceBucket = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_INSECURE_UPSTREAM")); v != "" {
+		cfg.InsecureUpstream = strings.EqualFold(v, "true")
+	}
+	if v := strings.TrimSpace(os.Getenv("OSS_SIGNATURE_VERSION")); v != "" {
+		cfg.SignatureVersion = strings.ToLower(v)
+	}
 }
 
 func inferRegion(endpoint string) string {
