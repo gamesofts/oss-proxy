@@ -19,6 +19,7 @@ export OSS_ACCESS_KEY_SECRET=your-sk
 # optional
 # export OSS_SECURITY_TOKEN=...
 # export OSS_FORCE_BUCKET=my-bucket
+# export OSS_REGION=cn-hangzhou
 # export LISTEN_ADDR=:8080
 
 go run .

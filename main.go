@@ -62,10 +62,13 @@ func getEnv(key, def string) string {
 
 func inferRegion(endpoint string) string {
 	host := strings.Split(endpoint, ":")[0]
-	if strings.HasPrefix(host, "oss-") {
-		trimmed := strings.TrimPrefix(host, "oss-")
-		parts := strings.SplitN(trimmed, ".", 2)
-		return parts[0]
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if strings.HasPrefix(label, "oss-") {
+			trimmed := strings.TrimPrefix(label, "oss-")
+			parts := strings.SplitN(trimmed, ".", 2)
+			return parts[0]
+		}
 	}
 	return ""
 }
@@ -270,7 +273,7 @@ func canonicalHeadersV4(h http.Header) (string, string) {
 	headers := make([]header, 0)
 	for k, vals := range h {
 		lk := strings.ToLower(strings.TrimSpace(k))
-		if lk == "authorization" {
+		if lk == "authorization" || lk == "host" {
 			continue
 		}
 		cleanVals := make([]string, 0, len(vals))
