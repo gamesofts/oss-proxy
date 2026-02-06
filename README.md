@@ -11,6 +11,7 @@
 - 可选 STS Token (`OSS_SECURITY_TOKEN`)
 - 可选 `OSS_SIGNATURE_VERSION` 指定签名版本：`v1`/`v4`/`auto`（默认 auto）
 - 支持通过 `OSS_CONFIG` 读取配置文件（JSON），环境变量会覆盖配置文件同名字段
+- 可选 `OSS_BUCKET_IN_HOST` 或配置 `bucketInHost`，将路径中的 bucket 提升为子域名（用于第三方域名访问报错场景）
 
 ## 运行
 
@@ -25,7 +26,8 @@ cat > oss-proxy.json <<'JSON'
   "securityToken": "",
   "forceBucket": "",
   "insecureUpstream": false,
-  "signatureVersion": "auto"
+  "signatureVersion": "auto",
+  "bucketInHost": false
 }
 JSON
 
@@ -42,6 +44,7 @@ export OSS_ACCESS_KEY_SECRET=your-sk
 # export OSS_FORCE_BUCKET=my-bucket
 # export OSS_REGION=cn-hangzhou
 # export OSS_SIGNATURE_VERSION=auto
+# export OSS_BUCKET_IN_HOST=false
 # export LISTEN_ADDR=:8080
 
 go run .

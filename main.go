@@ -29,6 +29,7 @@ type Config struct {
 	ForceBucket      string `json:"forceBucket"`
 	InsecureUpstream bool   `json:"insecureUpstream"`
 	SignatureVersion string `json:"signatureVersion"`
+	BucketInHost     bool   `json:"bucketInHost"`
 }
 
 func loadConfig() Config {
@@ -105,6 +106,9 @@ func overrideFromEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("OSS_SIGNATURE_VERSION")); v != "" {
 		cfg.SignatureVersion = strings.ToLower(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("OSS_BUCKET_IN_HOST")); v != "" {
+		cfg.BucketInHost = strings.EqualFold(v, "true")
+	}
 }
 
 func inferRegion(endpoint string) string {
@@ -150,7 +154,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.Body.Close()
 
-	targetURL, err := h.buildTargetURL(r)
+	targetURL, bucketName, bucketInHost, err := h.buildTargetURL(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -163,7 +167,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cloneHeaders(r.Header, upReq.Header)
-	h.sanitizeAndSign(upReq, bodyBytes)
+	h.sanitizeAndSign(upReq, bodyBytes, bucketName, bucketInHost)
 
 	resp, err := h.client.Do(upReq)
 	if err != nil {
@@ -177,7 +181,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, error) {
+func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, bool, error) {
 	scheme := "https"
 	if h.cfg.InsecureUpstream {
 		scheme = "http"
@@ -187,7 +191,24 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, error) {
 	if path == "" {
 		path = "/"
 	}
-	if h.cfg.ForceBucket != "" {
+
+	bucketName := h.cfg.ForceBucket
+	bucketInHost := false
+	if h.cfg.BucketInHost {
+		bucketInHost = true
+		if bucketName == "" {
+			first, rest, ok := splitBucketPath(path)
+			if !ok {
+				return nil, "", false, fmt.Errorf("missing bucket in path for bucket-in-host mode")
+			}
+			bucketName = first
+			path = rest
+		} else {
+			path = stripLeadingBucket(path, bucketName)
+		}
+	}
+
+	if !bucketInHost && h.cfg.ForceBucket != "" {
 		trimmed := strings.TrimPrefix(path, "/")
 		path = "/" + h.cfg.ForceBucket
 		if trimmed != "" {
@@ -196,23 +217,27 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, error) {
 	}
 
 	targetRawQuery := r.URL.RawQuery
+	host := h.cfg.Endpoint
+	if bucketInHost && bucketName != "" {
+		host = bucketName + "." + h.cfg.Endpoint
+	}
 	target := &url.URL{
 		Scheme:   scheme,
-		Host:     h.cfg.Endpoint,
+		Host:     host,
 		Path:     path,
 		RawPath:  path,
 		RawQuery: targetRawQuery,
 	}
-	return target, nil
+	return target, bucketName, bucketInHost, nil
 }
 
-func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte) {
+func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string, bucketInHost bool) {
 	removeHopByHopHeaders(req.Header)
 
 	useV4 := h.useV4(req.Header)
 
-	req.Host = h.cfg.Endpoint
-	req.Header.Set("Host", h.cfg.Endpoint)
+	req.Host = req.URL.Host
+	req.Header.Set("Host", req.URL.Host)
 	req.Header.Del("Authorization")
 	req.Header.Del("Date")
 	req.Header.Del("X-Oss-Date")
@@ -236,7 +261,7 @@ func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte) {
 	date := now.Format(http.TimeFormat)
 	req.Header.Set("Date", date)
 
-	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret)
+	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret, bucketName, bucketInHost)
 	req.Header.Set("Authorization", auth)
 }
 
@@ -259,13 +284,13 @@ func (h *proxyHandler) useV4(headers http.Header) bool {
 	}
 }
 
-func signV1(req *http.Request, ak, sk string) string {
+func signV1(req *http.Request, ak, sk string, bucketName string, bucketInHost bool) string {
 	md5 := req.Header.Get("Content-MD5")
 	contentType := req.Header.Get("Content-Type")
 	date := req.Header.Get("Date")
 
 	canonicalHeaders := buildCanonicalOSSHeaders(req.Header)
-	canonicalResource := buildCanonicalResource(req.URL)
+	canonicalResource := buildCanonicalResource(req.URL, bucketName, bucketInHost)
 
 	stringToSign := strings.Join([]string{
 		req.Method,
@@ -453,10 +478,13 @@ var subresourceAllowlist = map[string]struct{}{
 	"response-content-disposition": {}, "response-content-encoding": {}, "x-oss-process": {},
 }
 
-func buildCanonicalResource(u *url.URL) string {
+func buildCanonicalResource(u *url.URL, bucketName string, bucketInHost bool) string {
 	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
+	}
+	if bucketInHost && bucketName != "" {
+		path = "/" + bucketName + path
 	}
 
 	values := u.Query()
@@ -484,6 +512,35 @@ func buildCanonicalResource(u *url.URL) string {
 		parts = append(parts, k+"="+sortedVals[0])
 	}
 	return path + "?" + strings.Join(parts, "&")
+}
+
+func splitBucketPath(path string) (string, string, bool) {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(trimmed, "/", 2)
+	bucket := parts[0]
+	rest := "/"
+	if len(parts) > 1 && parts[1] != "" {
+		rest = "/" + parts[1]
+	}
+	return bucket, rest, true
+}
+
+func stripLeadingBucket(path, bucket string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "/"
+	}
+	prefix := bucket + "/"
+	if strings.HasPrefix(trimmed, prefix) {
+		trimmed = strings.TrimPrefix(trimmed, prefix)
+	}
+	if trimmed == "" {
+		return "/"
+	}
+	return "/" + trimmed
 }
 
 func removeHopByHopHeaders(h http.Header) {
