@@ -27,6 +27,7 @@ type Config struct {
 	SecurityToken    string
 	ForceBucket      string
 	InsecureUpstream bool
+	SignatureVersion string
 }
 
 func mustEnv(key string) string {
@@ -48,6 +49,7 @@ func loadConfig() Config {
 		SecurityToken:    strings.TrimSpace(os.Getenv("OSS_SECURITY_TOKEN")),
 		ForceBucket:      strings.TrimSpace(os.Getenv("OSS_FORCE_BUCKET")),
 		InsecureUpstream: strings.EqualFold(strings.TrimSpace(os.Getenv("OSS_INSECURE_UPSTREAM")), "true"),
+		SignatureVersion: strings.ToLower(strings.TrimSpace(getEnv("OSS_SIGNATURE_VERSION", "auto"))),
 	}
 	return cfg
 }
@@ -162,7 +164,7 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, error) {
 func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte) {
 	removeHopByHopHeaders(req.Header)
 
-	useV4 := shouldUseV4(req.Header)
+	useV4 := h.useV4(req.Header)
 
 	req.Host = h.cfg.Endpoint
 	req.Header.Set("Host", h.cfg.Endpoint)
@@ -199,6 +201,17 @@ func shouldUseV4(h http.Header) bool {
 	}
 	auth := strings.TrimSpace(h.Get("Authorization"))
 	return strings.HasPrefix(auth, "OSS4-HMAC-SHA256")
+}
+
+func (h *proxyHandler) useV4(headers http.Header) bool {
+	switch h.cfg.SignatureVersion {
+	case "v1":
+		return false
+	case "v4":
+		return true
+	default:
+		return shouldUseV4(headers)
+	}
 }
 
 func signV1(req *http.Request, ak, sk string) string {

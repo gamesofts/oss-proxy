@@ -9,6 +9,7 @@
 - 支持透传 `x-oss-*` 头并纳入签名
 - 可选设置 `OSS_FORCE_BUCKET`，将所有请求强制路由到同一 bucket
 - 可选 STS Token (`OSS_SECURITY_TOKEN`)
+- 可选 `OSS_SIGNATURE_VERSION` 指定签名版本：`v1`/`v4`/`auto`（默认 auto）
 
 ## 运行
 
@@ -20,6 +21,7 @@ export OSS_ACCESS_KEY_SECRET=your-sk
 # export OSS_SECURITY_TOKEN=...
 # export OSS_FORCE_BUCKET=my-bucket
 # export OSS_REGION=cn-hangzhou
+# export OSS_SIGNATURE_VERSION=auto
 # export LISTEN_ADDR=:8080
 
 go run .
