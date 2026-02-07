@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,35 +18,27 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string `json:"listenAddr"`
-	Endpoint         string `json:"endpoint"`
-	Region           string `json:"region"`
-	AccessKeyID      string `json:"accessKeyId"`
-	AccessKeySecret  string `json:"accessKeySecret"`
-	SecurityToken    string `json:"securityToken"`
-	ForceBucket      string `json:"forceBucket"`
-	InsecureUpstream bool   `json:"insecureUpstream"`
-	SignatureVersion string `json:"signatureVersion"`
-	BucketInHost     bool   `json:"bucketInHost"`
+	ListenAddr      string `json:"listenAddr"`
+	Endpoint        string `json:"endpoint"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"accessKeyId"`
+	AccessKeySecret string `json:"accessKeySecret"`
 }
 
 func loadConfig() Config {
 	cfg := Config{
-		ListenAddr:       ":8080",
-		SignatureVersion: "auto",
+		ListenAddr: ":8080",
 	}
 	loadConfigFile(&cfg)
 
-	overrideFromEnv(&cfg)
-
 	if cfg.Endpoint == "" {
-		log.Fatalf("missing required config: OSS_ENDPOINT")
+		log.Fatalf("missing required config in config.json: endpoint")
 	}
 	if cfg.AccessKeyID == "" {
-		log.Fatalf("missing required config: OSS_ACCESS_KEY_ID")
+		log.Fatalf("missing required config in config.json: accessKeyId")
 	}
 	if cfg.AccessKeySecret == "" {
-		log.Fatalf("missing required config: OSS_ACCESS_KEY_SECRET")
+		log.Fatalf("missing required config in config.json: accessKeySecret")
 	}
 	if cfg.Region == "" {
 		cfg.Region = inferRegion(cfg.Endpoint)
@@ -56,58 +46,14 @@ func loadConfig() Config {
 	return cfg
 }
 
-func getEnv(key, def string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	return v
-}
-
 func loadConfigFile(cfg *Config) {
-	path := strings.TrimSpace(os.Getenv("OSS_CONFIG"))
-	if path == "" {
-		return
-	}
+	path := "config.json"
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("failed to read OSS_CONFIG: %v", err)
+		log.Fatalf("failed to read %s: %v", path, err)
 	}
 	if err := json.Unmarshal(raw, cfg); err != nil {
-		log.Fatalf("failed to parse OSS_CONFIG: %v", err)
-	}
-}
-
-func overrideFromEnv(cfg *Config) {
-	if v := strings.TrimSpace(os.Getenv("LISTEN_ADDR")); v != "" {
-		cfg.ListenAddr = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_ENDPOINT")); v != "" {
-		cfg.Endpoint = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_REGION")); v != "" {
-		cfg.Region = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_ID")); v != "" {
-		cfg.AccessKeyID = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_SECRET")); v != "" {
-		cfg.AccessKeySecret = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_SECURITY_TOKEN")); v != "" {
-		cfg.SecurityToken = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_FORCE_BUCKET")); v != "" {
-		cfg.ForceBucket = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_INSECURE_UPSTREAM")); v != "" {
-		cfg.InsecureUpstream = strings.EqualFold(v, "true")
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_SIGNATURE_VERSION")); v != "" {
-		cfg.SignatureVersion = strings.ToLower(v)
-	}
-	if v := strings.TrimSpace(os.Getenv("OSS_BUCKET_IN_HOST")); v != "" {
-		cfg.BucketInHost = strings.EqualFold(v, "true")
+		log.Fatalf("failed to parse %s: %v", path, err)
 	}
 }
 
@@ -154,7 +100,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.Body.Close()
 
-	targetURL, bucketName, bucketInHost, err := h.buildTargetURL(r)
+	targetURL, bucketName, err := h.buildTargetURL(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -167,7 +113,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cloneHeaders(r.Header, upReq.Header)
-	h.sanitizeAndSign(upReq, bodyBytes, bucketName, bucketInHost)
+	h.sanitizeAndSign(upReq, bodyBytes, bucketName)
 
 	resp, err := h.client.Do(upReq)
 	if err != nil {
@@ -181,44 +127,25 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, bool, error) {
+func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error) {
 	scheme := "https"
-	if h.cfg.InsecureUpstream {
-		scheme = "http"
-	}
 
 	path := r.URL.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
 
-	bucketName := h.cfg.ForceBucket
-	bucketInHost := false
-	if h.cfg.BucketInHost {
-		bucketInHost = true
-		if bucketName == "" {
-			first, rest, ok := splitBucketPath(path)
-			if ok {
-				bucketName = first
-				path = rest
-			}
-		} else {
-			path = stripLeadingBucket(path, bucketName)
-		}
-	}
-
-	if !bucketInHost && h.cfg.ForceBucket != "" {
-		trimmed := strings.TrimPrefix(path, "/")
-		path = "/" + h.cfg.ForceBucket
-		if trimmed != "" {
-			path += "/" + trimmed
-		}
+	first, rest, ok := splitBucketPath(path)
+	bucketName := ""
+	if ok {
+		bucketName = first
+		path = rest
 	}
 
 	targetRawQuery := r.URL.RawQuery
 	host := h.cfg.Endpoint
-	if bucketInHost && bucketName != "" {
-		host = bucketName + "." + h.cfg.Endpoint
+	if bucketName != "" {
+		host = buildBucketHost(bucketName, h.cfg.Endpoint)
 	}
 	target := &url.URL{
 		Scheme:   scheme,
@@ -227,13 +154,11 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, bool, 
 		RawPath:  path,
 		RawQuery: targetRawQuery,
 	}
-	return target, bucketName, bucketInHost, nil
+	return target, bucketName, nil
 }
 
-func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string, bucketInHost bool) {
+func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string) {
 	removeHopByHopHeaders(req.Header)
-
-	useV4 := h.useV4(req.Header)
 
 	req.Host = req.URL.Host
 	req.Header.Set("Host", req.URL.Host)
@@ -247,49 +172,21 @@ func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketNam
 		req.ContentLength = 0
 	}
 
-	if h.cfg.SecurityToken != "" {
-		req.Header.Set("x-oss-security-token", h.cfg.SecurityToken)
-	}
-
-	if useV4 {
-		h.signV4(req, body)
-		return
-	}
-
 	now := time.Now().UTC()
 	date := now.Format(http.TimeFormat)
 	req.Header.Set("Date", date)
 
-	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret, bucketName, bucketInHost)
+	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret, bucketName)
 	req.Header.Set("Authorization", auth)
 }
 
-func shouldUseV4(h http.Header) bool {
-	if strings.EqualFold(strings.TrimSpace(h.Get("x-oss-signature-version")), "OSS4-HMAC-SHA256") {
-		return true
-	}
-	auth := strings.TrimSpace(h.Get("Authorization"))
-	return strings.HasPrefix(auth, "OSS4-HMAC-SHA256")
-}
-
-func (h *proxyHandler) useV4(headers http.Header) bool {
-	switch h.cfg.SignatureVersion {
-	case "v1":
-		return false
-	case "v4":
-		return true
-	default:
-		return shouldUseV4(headers)
-	}
-}
-
-func signV1(req *http.Request, ak, sk string, bucketName string, bucketInHost bool) string {
+func signV1(req *http.Request, ak, sk string, bucketName string) string {
 	md5 := req.Header.Get("Content-MD5")
 	contentType := req.Header.Get("Content-Type")
 	date := req.Header.Get("Date")
 
 	canonicalHeaders := buildCanonicalOSSHeaders(req.Header)
-	canonicalResource := buildCanonicalResource(req.URL, bucketName, bucketInHost)
+	canonicalResource := buildCanonicalResource(req.URL, bucketName)
 
 	stringToSign := strings.Join([]string{
 		req.Method,
@@ -303,147 +200,6 @@ func signV1(req *http.Request, ak, sk string, bucketName string, bucketInHost bo
 	_, _ = mac.Write([]byte(stringToSign))
 	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	return "OSS " + ak + ":" + sig
-}
-
-func (h *proxyHandler) signV4(req *http.Request, body []byte) {
-	amzDate := time.Now().UTC().Format("20060102T150405Z")
-	req.Header.Set("x-oss-date", amzDate)
-	req.Header.Set("x-oss-signature-version", "OSS4-HMAC-SHA256")
-	if h.cfg.SecurityToken != "" {
-		req.Header.Set("x-oss-security-token", h.cfg.SecurityToken)
-	}
-
-	payloadHash := sha256Hex(body)
-	req.Header.Set("x-oss-content-sha256", payloadHash)
-
-	canonicalHeaders, signedHeaders := canonicalHeadersV4(req.Header)
-	canonicalRequest := strings.Join([]string{
-		req.Method,
-		canonicalURI(req.URL),
-		canonicalQuery(req.URL),
-		canonicalHeaders,
-		signedHeaders,
-		payloadHash,
-	}, "\n")
-
-	credentialScope := fmt.Sprintf("%s/%s/oss/aliyun_v4_request", amzDate[:8], h.cfg.Region)
-	stringToSign := strings.Join([]string{
-		"OSS4-HMAC-SHA256",
-		amzDate,
-		credentialScope,
-		sha256Hex([]byte(canonicalRequest)),
-	}, "\n")
-
-	signingKey := v4SigningKey(h.cfg.AccessKeySecret, amzDate[:8], h.cfg.Region)
-	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
-
-	authorization := fmt.Sprintf(
-		"OSS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		h.cfg.AccessKeyID,
-		credentialScope,
-		signedHeaders,
-		signature,
-	)
-	req.Header.Set("Authorization", authorization)
-}
-
-func canonicalHeadersV4(h http.Header) (string, string) {
-	type header struct {
-		key   string
-		value string
-	}
-	headers := make([]header, 0)
-	for k, vals := range h {
-		lk := strings.ToLower(strings.TrimSpace(k))
-		if lk == "authorization" || lk == "host" {
-			continue
-		}
-		cleanVals := make([]string, 0, len(vals))
-		for _, v := range vals {
-			cleanVals = append(cleanVals, strings.TrimSpace(v))
-		}
-		headers = append(headers, header{key: lk, value: strings.Join(cleanVals, ",")})
-	}
-	host := h.Get("Host")
-	if host == "" {
-		host = h.Get("host")
-	}
-	if host != "" {
-		headers = append(headers, header{key: "host", value: host})
-	}
-	if len(headers) == 0 {
-		return "", ""
-	}
-	sort.Slice(headers, func(i, j int) bool {
-		return headers[i].key < headers[j].key
-	})
-
-	var canonical strings.Builder
-	signed := make([]string, 0, len(headers))
-	for _, hv := range headers {
-		canonical.WriteString(hv.key)
-		canonical.WriteString(":")
-		canonical.WriteString(hv.value)
-		canonical.WriteString("\n")
-		signed = append(signed, hv.key)
-	}
-	return canonical.String(), strings.Join(signed, ";")
-}
-
-func canonicalURI(u *url.URL) string {
-	path := u.EscapedPath()
-	if path == "" {
-		return "/"
-	}
-	return path
-}
-
-func canonicalQuery(u *url.URL) string {
-	values := u.Query()
-	if len(values) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(values))
-	for k := range values {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		vals := values[k]
-		sort.Strings(vals)
-		for _, v := range vals {
-			parts = append(parts, encodeQueryComponent(k)+"="+encodeQueryComponent(v))
-		}
-	}
-	return strings.Join(parts, "&")
-}
-
-func encodeQueryComponent(value string) string {
-	escaped := url.QueryEscape(value)
-	escaped = strings.ReplaceAll(escaped, "+", "%20")
-	escaped = strings.ReplaceAll(escaped, "%7E", "~")
-	return escaped
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-func v4SigningKey(secret, date, region string) []byte {
-	kDate := hmacSHA256([]byte("aliyun_v4"+secret), date)
-	kRegion := hmacSHA256(kDate, region)
-	kService := hmacSHA256(kRegion, "oss")
-	kSigning := hmacSHA256(kService, "aliyun_v4_request")
-	return kSigning
-}
-
-func hmacSHA256(key []byte, data string) []byte {
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(data))
-	return mac.Sum(nil)
 }
 
 func buildCanonicalOSSHeaders(h http.Header) string {
@@ -469,6 +225,7 @@ func buildCanonicalOSSHeaders(h http.Header) string {
 var subresourceAllowlist = map[string]struct{}{
 	"acl": {}, "uploads": {}, "location": {}, "cors": {}, "logging": {}, "website": {}, "referer": {},
 	"lifecycle": {}, "delete": {}, "append": {}, "tagging": {}, "objectmeta": {}, "uploadid": {}, "partnumber": {},
+	"bucketinfo":     {},
 	"security-token": {}, "position": {}, "symlink": {}, "restore": {}, "replication": {}, "replicationlocation": {},
 	"replicationprogress": {}, "transferacceleration": {}, "cname": {}, "live": {}, "status": {}, "comp": {}, "vod": {},
 	"starttime": {}, "endtime": {}, "inventory": {}, "inventoryid": {}, "continuation-token": {}, "asyncfetch": {},
@@ -477,12 +234,12 @@ var subresourceAllowlist = map[string]struct{}{
 	"response-content-disposition": {}, "response-content-encoding": {}, "x-oss-process": {},
 }
 
-func buildCanonicalResource(u *url.URL, bucketName string, bucketInHost bool) string {
+func buildCanonicalResource(u *url.URL, bucketName string) string {
 	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
-	if bucketInHost && bucketName != "" {
+	if bucketName != "" {
 		path = "/" + bucketName + path
 	}
 
@@ -513,6 +270,18 @@ func buildCanonicalResource(u *url.URL, bucketName string, bucketInHost bool) st
 	return path + "?" + strings.Join(parts, "&")
 }
 
+func buildBucketHost(bucketName, endpoint string) string {
+	parsed, err := url.Parse("//" + endpoint)
+	if err != nil || parsed.Hostname() == "" {
+		return bucketName + "." + endpoint
+	}
+	host := bucketName + "." + parsed.Hostname()
+	if parsed.Port() != "" {
+		host += ":" + parsed.Port()
+	}
+	return host
+}
+
 func splitBucketPath(path string) (string, string, bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	if trimmed == "" {
@@ -525,21 +294,6 @@ func splitBucketPath(path string) (string, string, bool) {
 		rest = "/" + parts[1]
 	}
 	return bucket, rest, true
-}
-
-func stripLeadingBucket(path, bucket string) string {
-	trimmed := strings.TrimPrefix(path, "/")
-	if trimmed == "" {
-		return "/"
-	}
-	prefix := bucket + "/"
-	if strings.HasPrefix(trimmed, prefix) {
-		trimmed = strings.TrimPrefix(trimmed, prefix)
-	}
-	if trimmed == "" {
-		return "/"
-	}
-	return "/" + trimmed
 }
 
 func removeHopByHopHeaders(h http.Header) {
