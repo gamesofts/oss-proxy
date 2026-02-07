@@ -146,7 +146,7 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		bucketName = bucketFromHost(r.Host, h.cfg.Endpoint)
 	}
 
-	targetRawQuery := r.URL.RawQuery
+	targetRawQuery := stripAuthQueryParams(r.URL.Query()).Encode()
 	host := h.cfg.Endpoint
 	if bucketName != "" {
 		host = buildBucketHost(bucketName, h.cfg.Endpoint)
@@ -159,6 +159,31 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		RawQuery: targetRawQuery,
 	}
 	return target, bucketName, nil
+}
+
+func stripAuthQueryParams(values url.Values) url.Values {
+	if len(values) == 0 {
+		return values
+	}
+	filtered := make(url.Values, len(values))
+	for k, v := range values {
+		if isAuthQueryParam(k) {
+			continue
+		}
+		filtered[k] = append([]string(nil), v...)
+	}
+	return filtered
+}
+
+func isAuthQueryParam(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "ossaccesskeyid", "signature", "expires",
+		"x-oss-signature-version", "x-oss-credential", "x-oss-date", "x-oss-expires", "x-oss-signature", "x-oss-additional-headers",
+		"security-token", "x-oss-security-token":
+		return true
+	default:
+		return false
+	}
 }
 
 func bucketFromHost(incomingHost, endpoint string) string {
