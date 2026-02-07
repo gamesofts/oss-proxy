@@ -136,20 +136,24 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		path = "/"
 	}
 
-	first, rest, ok := splitBucketPath(path)
-	bucketName := ""
-	if ok {
-		bucketName = first
-		path = rest
-	}
+	bucketName := bucketFromHost(r.Host, h.cfg.Endpoint)
 	if bucketName == "" {
-		bucketName = bucketFromHost(r.Host, h.cfg.Endpoint)
+		first, rest, ok := splitBucketPath(path)
+		if ok {
+			bucketName = first
+			path = rest
+		}
 	}
 
 	targetRawQuery := stripAuthQueryParams(r.URL.Query()).Encode()
 	host := h.cfg.Endpoint
 	if bucketName != "" {
-		host = buildBucketHost(bucketName, h.cfg.Endpoint)
+		if strings.Contains(bucketName, ".") {
+			// Buckets with dots can break TLS wildcard validation in virtual-host style.
+			path = ensureBucketInPath(path, bucketName)
+		} else {
+			host = buildBucketHost(bucketName, h.cfg.Endpoint)
+		}
 	}
 	target := &url.URL{
 		Scheme:   scheme,
@@ -215,10 +219,21 @@ func bucketFromHost(incomingHost, endpoint string) string {
 		return ""
 	}
 	bucket := strings.TrimSuffix(host, suffix)
-	if bucket == "" || strings.Contains(bucket, ".") {
+	if bucket == "" {
 		return ""
 	}
 	return bucket
+}
+
+func ensureBucketInPath(path, bucket string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "/" + bucket
+	}
+	if trimmed == bucket || strings.HasPrefix(trimmed, bucket+"/") {
+		return "/" + trimmed
+	}
+	return "/" + bucket + "/" + trimmed
 }
 
 func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string) {
@@ -304,7 +319,10 @@ func buildCanonicalResource(u *url.URL, bucketName string) string {
 		path = "/"
 	}
 	if bucketName != "" {
-		path = "/" + bucketName + path
+		trimmed := strings.TrimPrefix(path, "/")
+		if trimmed != bucketName && !strings.HasPrefix(trimmed, bucketName+"/") {
+			path = "/" + bucketName + path
+		}
 	}
 
 	values := u.Query()
