@@ -8,6 +8,7 @@
 - 使用代理服务器时间重建 `Date` 与 `Authorization`
 - 支持透传 `x-oss-*` 头并纳入签名
 - 自动根据请求路径识别 bucket 并使用三级域名访问（同时保留服务级请求如列举 bucket）
+- 若账号下仅有一个 bucket，代理会自动推断为默认 bucket，兼容 `/object-key` 这类不带 bucket 的客户端请求
 
 ## 运行
 

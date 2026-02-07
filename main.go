@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,7 @@ type Config struct {
 	Region          string `json:"region"`
 	AccessKeyID     string `json:"accessKeyId"`
 	AccessKeySecret string `json:"accessKeySecret"`
+	DefaultBucket   string `json:"-"`
 }
 
 func loadConfig() Config {
@@ -43,6 +45,10 @@ func loadConfig() Config {
 	}
 	if cfg.Region == "" {
 		cfg.Region = inferRegion(cfg.Endpoint)
+	}
+	cfg.DefaultBucket = detectDefaultBucket(cfg)
+	if cfg.DefaultBucket != "" {
+		log.Printf("default bucket inferred: %s", cfg.DefaultBucket)
 	}
 	return cfg
 }
@@ -136,16 +142,10 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		path = "/"
 	}
 
-	bucketName := bucketFromHost(r.Host, h.cfg.Endpoint)
-	if bucketName == "" {
-		first, rest, ok := splitBucketPath(path)
-		if ok {
-			bucketName = first
-			path = rest
-		}
-	}
+	queryValues := stripAuthQueryParams(r.URL.Query())
+	targetRawQuery := queryValues.Encode()
+	bucketName, path := resolveBucketAndPath(r.Host, path, queryValues, h.cfg.Endpoint, h.cfg.DefaultBucket)
 
-	targetRawQuery := stripAuthQueryParams(r.URL.Query()).Encode()
 	host := h.cfg.Endpoint
 	if bucketName != "" {
 		if strings.Contains(bucketName, ".") {
@@ -163,6 +163,87 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		RawQuery: targetRawQuery,
 	}
 	return target, bucketName, nil
+}
+
+func resolveBucketAndPath(incomingHost, path string, queryValues url.Values, endpoint, defaultBucket string) (string, string) {
+	if hostBucket := bucketFromHost(incomingHost, endpoint); hostBucket != "" {
+		return hostBucket, path
+	}
+
+	trimmed := strings.TrimPrefix(path, "/")
+	if defaultBucket != "" {
+		if trimmed == "" {
+			if isLikelyBucketScopeRootQuery(queryValues) {
+				return defaultBucket, path
+			}
+			return "", path
+		}
+		if trimmed == defaultBucket {
+			return defaultBucket, "/"
+		}
+		if strings.HasPrefix(trimmed, defaultBucket+"/") {
+			return defaultBucket, "/" + strings.TrimPrefix(trimmed, defaultBucket+"/")
+		}
+		return defaultBucket, path
+	}
+
+	first, rest, ok := splitBucketPath(path)
+	if !ok {
+		return "", path
+	}
+	return first, rest
+}
+
+func isLikelyBucketScopeRootQuery(values url.Values) bool {
+	if len(values) == 0 {
+		return false
+	}
+	keys := []string{
+		"list-type", "prefix", "delimiter", "start-after", "continuation-token", "encoding-type", "fetch-owner", "marker",
+	}
+	for _, k := range keys {
+		if _, ok := values[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func detectDefaultBucket(cfg Config) string {
+	req, err := http.NewRequest(http.MethodGet, "https://"+cfg.Endpoint+"/?max-keys=1000", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	req.Header.Set("Authorization", signV1(req, cfg.AccessKeyID, cfg.AccessKeySecret, ""))
+
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	var result struct {
+		Buckets struct {
+			Bucket []struct {
+				Name string `xml:"Name"`
+			} `xml:"Bucket"`
+		} `xml:"Buckets"`
+	}
+	if err := xml.Unmarshal(raw, &result); err != nil {
+		return ""
+	}
+	if len(result.Buckets.Bucket) != 1 {
+		return ""
+	}
+	return strings.TrimSpace(result.Buckets.Bucket[0].Name)
 }
 
 func stripAuthQueryParams(values url.Values) url.Values {
