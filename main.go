@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -141,6 +142,9 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		bucketName = first
 		path = rest
 	}
+	if bucketName == "" {
+		bucketName = bucketFromHost(r.Host, h.cfg.Endpoint)
+	}
 
 	targetRawQuery := r.URL.RawQuery
 	host := h.cfg.Endpoint
@@ -155,6 +159,41 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		RawQuery: targetRawQuery,
 	}
 	return target, bucketName, nil
+}
+
+func bucketFromHost(incomingHost, endpoint string) string {
+	host := strings.TrimSpace(strings.ToLower(incomingHost))
+	if host == "" {
+		return ""
+	}
+	if strings.Contains(host, ":") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			host = parsedHost
+		}
+	}
+
+	endpointHost := strings.TrimSpace(strings.ToLower(endpoint))
+	if endpointHost == "" {
+		return ""
+	}
+	if strings.Contains(endpointHost, ":") {
+		if parsedHost, _, err := net.SplitHostPort(endpointHost); err == nil {
+			endpointHost = parsedHost
+		}
+	}
+
+	if host == endpointHost {
+		return ""
+	}
+	suffix := "." + endpointHost
+	if !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	bucket := strings.TrimSuffix(host, suffix)
+	if bucket == "" || strings.Contains(bucket, ".") {
+		return ""
+	}
+	return bucket
 }
 
 func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string) {
