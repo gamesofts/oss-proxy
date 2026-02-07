@@ -6,11 +6,9 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,10 +20,10 @@ import (
 type Config struct {
 	ListenAddr      string `json:"listenAddr"`
 	Endpoint        string `json:"endpoint"`
+	Bucket          string `json:"bucket"`
 	Region          string `json:"region"`
 	AccessKeyID     string `json:"accessKeyId"`
 	AccessKeySecret string `json:"accessKeySecret"`
-	DefaultBucket   string `json:"-"`
 }
 
 func loadConfig() Config {
@@ -37,6 +35,9 @@ func loadConfig() Config {
 	if cfg.Endpoint == "" {
 		log.Fatalf("missing required config in config.json: endpoint")
 	}
+	if strings.TrimSpace(cfg.Bucket) == "" {
+		log.Fatalf("missing required config in config.json: bucket")
+	}
 	if cfg.AccessKeyID == "" {
 		log.Fatalf("missing required config in config.json: accessKeyId")
 	}
@@ -45,10 +46,6 @@ func loadConfig() Config {
 	}
 	if cfg.Region == "" {
 		cfg.Region = inferRegion(cfg.Endpoint)
-	}
-	cfg.DefaultBucket = detectDefaultBucket(cfg)
-	if cfg.DefaultBucket != "" {
-		log.Printf("default bucket inferred: %s", cfg.DefaultBucket)
 	}
 	return cfg
 }
@@ -136,114 +133,47 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error) {
 	scheme := "https"
+	bucketName := strings.TrimSpace(h.cfg.Bucket)
 
-	path := r.URL.EscapedPath()
+	path := r.URL.Path
 	if path == "" {
 		path = "/"
 	}
+	path = normalizePath(path)
+	path = stripLeadingBucket(path, bucketName)
 
 	queryValues := stripAuthQueryParams(r.URL.Query())
 	targetRawQuery := queryValues.Encode()
-	bucketName, path := resolveBucketAndPath(r.Host, path, queryValues, h.cfg.Endpoint, h.cfg.DefaultBucket)
 
 	host := h.cfg.Endpoint
-	if bucketName != "" {
-		if strings.Contains(bucketName, ".") {
-			// Buckets with dots can break TLS wildcard validation in virtual-host style.
-			path = ensureBucketInPath(path, bucketName)
-		} else {
-			host = buildBucketHost(bucketName, h.cfg.Endpoint)
-		}
+	if strings.Contains(bucketName, ".") {
+		// Buckets with dots can break TLS wildcard validation in virtual-host style.
+		path = ensureBucketInPath(path, bucketName)
+	} else {
+		host = buildBucketHost(bucketName, h.cfg.Endpoint)
 	}
 	target := &url.URL{
 		Scheme:   scheme,
 		Host:     host,
 		Path:     path,
-		RawPath:  path,
 		RawQuery: targetRawQuery,
 	}
 	return target, bucketName, nil
 }
 
-func resolveBucketAndPath(incomingHost, path string, queryValues url.Values, endpoint, defaultBucket string) (string, string) {
-	if hostBucket := bucketFromHost(incomingHost, endpoint); hostBucket != "" {
-		return hostBucket, path
-	}
-
-	trimmed := strings.TrimPrefix(path, "/")
-	if defaultBucket != "" {
-		if trimmed == "" {
-			if isLikelyBucketScopeRootQuery(queryValues) {
-				return defaultBucket, path
-			}
-			return "", path
+func normalizePath(path string) string {
+	normalized := path
+	for i := 0; i < 2; i++ {
+		unescaped, err := url.PathUnescape(normalized)
+		if err != nil || unescaped == normalized {
+			break
 		}
-		if trimmed == defaultBucket {
-			return defaultBucket, "/"
-		}
-		if strings.HasPrefix(trimmed, defaultBucket+"/") {
-			return defaultBucket, "/" + strings.TrimPrefix(trimmed, defaultBucket+"/")
-		}
-		return defaultBucket, path
+		normalized = unescaped
 	}
-
-	first, rest, ok := splitBucketPath(path)
-	if !ok {
-		return "", path
+	if normalized == "" {
+		return "/"
 	}
-	return first, rest
-}
-
-func isLikelyBucketScopeRootQuery(values url.Values) bool {
-	if len(values) == 0 {
-		return false
-	}
-	keys := []string{
-		"list-type", "prefix", "delimiter", "start-after", "continuation-token", "encoding-type", "fetch-owner", "marker",
-	}
-	for _, k := range keys {
-		if _, ok := values[k]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func detectDefaultBucket(cfg Config) string {
-	req, err := http.NewRequest(http.MethodGet, "https://"+cfg.Endpoint+"/?max-keys=1000", nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
-	req.Header.Set("Authorization", signV1(req, cfg.AccessKeyID, cfg.AccessKeySecret, ""))
-
-	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	var result struct {
-		Buckets struct {
-			Bucket []struct {
-				Name string `xml:"Name"`
-			} `xml:"Bucket"`
-		} `xml:"Buckets"`
-	}
-	if err := xml.Unmarshal(raw, &result); err != nil {
-		return ""
-	}
-	if len(result.Buckets.Bucket) != 1 {
-		return ""
-	}
-	return strings.TrimSpace(result.Buckets.Bucket[0].Name)
+	return normalized
 }
 
 func stripAuthQueryParams(values url.Values) url.Values {
@@ -271,41 +201,6 @@ func isAuthQueryParam(key string) bool {
 	}
 }
 
-func bucketFromHost(incomingHost, endpoint string) string {
-	host := strings.TrimSpace(strings.ToLower(incomingHost))
-	if host == "" {
-		return ""
-	}
-	if strings.Contains(host, ":") {
-		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-			host = parsedHost
-		}
-	}
-
-	endpointHost := strings.TrimSpace(strings.ToLower(endpoint))
-	if endpointHost == "" {
-		return ""
-	}
-	if strings.Contains(endpointHost, ":") {
-		if parsedHost, _, err := net.SplitHostPort(endpointHost); err == nil {
-			endpointHost = parsedHost
-		}
-	}
-
-	if host == endpointHost {
-		return ""
-	}
-	suffix := "." + endpointHost
-	if !strings.HasSuffix(host, suffix) {
-		return ""
-	}
-	bucket := strings.TrimSuffix(host, suffix)
-	if bucket == "" {
-		return ""
-	}
-	return bucket
-}
-
 func ensureBucketInPath(path, bucket string) string {
 	trimmed := strings.TrimPrefix(path, "/")
 	if trimmed == "" {
@@ -317,6 +212,24 @@ func ensureBucketInPath(path, bucket string) string {
 	return "/" + bucket + "/" + trimmed
 }
 
+func stripLeadingBucket(path, bucket string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "/"
+	}
+	if trimmed == bucket {
+		return "/"
+	}
+	prefix := bucket + "/"
+	if strings.HasPrefix(trimmed, prefix) {
+		trimmed = strings.TrimPrefix(trimmed, prefix)
+	}
+	if trimmed == "" {
+		return "/"
+	}
+	return "/" + trimmed
+}
+
 func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string) {
 	removeHopByHopHeaders(req.Header)
 
@@ -325,6 +238,10 @@ func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketNam
 	req.Header.Del("Authorization")
 	req.Header.Del("Date")
 	req.Header.Del("X-Oss-Date")
+	// Force V1 signing semantics even when clients send V4-specific headers.
+	req.Header.Del("X-Oss-Signature-Version")
+	req.Header.Del("X-Oss-Content-Sha256")
+	req.Header.Del("X-Oss-Additional-Headers")
 
 	if len(body) > 0 {
 		req.ContentLength = int64(len(body))
@@ -395,7 +312,7 @@ var subresourceAllowlist = map[string]struct{}{
 }
 
 func buildCanonicalResource(u *url.URL, bucketName string) string {
-	path := u.EscapedPath()
+	path := u.Path
 	if path == "" {
 		path = "/"
 	}
@@ -443,20 +360,6 @@ func buildBucketHost(bucketName, endpoint string) string {
 		host += ":" + parsed.Port()
 	}
 	return host
-}
-
-func splitBucketPath(path string) (string, string, bool) {
-	trimmed := strings.TrimPrefix(path, "/")
-	if trimmed == "" {
-		return "", "", false
-	}
-	parts := strings.SplitN(trimmed, "/", 2)
-	bucket := parts[0]
-	rest := "/"
-	if len(parts) > 1 && parts[1] != "" {
-		rest = "/" + parts[1]
-	}
-	return bucket, rest, true
 }
 
 func removeHopByHopHeaders(h http.Header) {

@@ -7,8 +7,6 @@
 - 透明转发任意 OSS HTTP API（路径、方法、查询参数、请求体都保持原样）
 - 使用代理服务器时间重建 `Date` 与 `Authorization`
 - 支持透传 `x-oss-*` 头并纳入签名
-- 自动根据请求路径识别 bucket 并使用三级域名访问（同时保留服务级请求如列举 bucket）
-- 若账号下仅有一个 bucket，代理会自动推断为默认 bucket，兼容 `/object-key` 这类不带 bucket 的客户端请求
 
 ## 运行
 
@@ -17,6 +15,7 @@ cat > config.json <<'JSON'
 {
   "listenAddr": ":8080",
   "endpoint": "oss-cn-hangzhou.aliyuncs.com",
+  "bucket": "your-bucket",
   "region": "cn-hangzhou",
   "accessKeyId": "your-ak",
   "accessKeySecret": "your-sk"
@@ -28,9 +27,7 @@ go run .
 
 ## 使用方式
 
-把测试客户端原本访问 OSS 的地址改为访问本服务：
-
-- 原：`https://oss-cn-hangzhou.aliyuncs.com/bucket/key`
-- 新：`http://proxy-host:8080/bucket/key`
+- 原：`https://oss-cn-hangzhou.aliyuncs.com/your-bucket/key`
+- 新：`http://proxy-host:8080/key`（或 `http://proxy-host:8080/your-bucket/key`）
 
 代理会自动重建签名并转发到 `endpoint`。
