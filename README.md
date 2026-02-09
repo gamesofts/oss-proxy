@@ -14,11 +14,11 @@
 cat > config.json <<'JSON'
 {
   "listenAddr": ":8080",
-  "endpoint": "oss-cn-hangzhou.aliyuncs.com",
-  "bucket": "your-bucket",
+  "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
   "region": "cn-hangzhou",
   "accessKeyId": "your-ak",
-  "accessKeySecret": "your-sk"
+  "accessKeySecret": "your-sk",
+  "bucket": "your-bucket"
 }
 JSON
 

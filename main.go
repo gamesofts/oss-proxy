@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -26,6 +27,7 @@ type Config struct {
 	Region          string `json:"region"`
 	AccessKeyID     string `json:"accessKeyId"`
 	AccessKeySecret string `json:"accessKeySecret"`
+	InsecureTLS     *bool  `json:"insecureSkipVerify"`
 }
 
 func loadConfig() Config {
@@ -49,6 +51,9 @@ func loadConfig() Config {
 	if cfg.Region == "" {
 		cfg.Region = inferRegion(cfg.Endpoint)
 	}
+	if _, _, _, err := parseEndpoint(cfg.Endpoint); err != nil {
+		log.Fatalf("invalid config endpoint=%q: %v", cfg.Endpoint, err)
+	}
 	return cfg
 }
 
@@ -64,7 +69,7 @@ func loadConfigFile(cfg *Config) {
 }
 
 func inferRegion(endpoint string) string {
-	host := strings.Split(endpoint, ":")[0]
+	host := extractEndpointHostname(endpoint)
 	labels := strings.Split(host, ".")
 	for _, label := range labels {
 		if strings.HasPrefix(label, "oss-") {
@@ -79,7 +84,12 @@ func inferRegion(endpoint string) string {
 func main() {
 	cfg := loadConfig()
 
-	h := &proxyHandler{cfg: cfg, client: &http.Client{Timeout: 0}}
+	client, err := buildHTTPClient(cfg)
+	if err != nil {
+		log.Fatalf("failed to build upstream client: %v", err)
+	}
+
+	h := &proxyHandler{cfg: cfg, client: client}
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           h,
@@ -90,6 +100,34 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+func buildHTTPClient(cfg Config) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	scheme, _, _, err := parseEndpoint(cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(scheme, "https") {
+		insecureTLS := cfg.insecureTLS()
+		tlsConfig := &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: insecureTLS,
+		}
+		transport.TLSClientConfig = tlsConfig
+	}
+
+	return &http.Client{
+		Timeout:   0,
+		Transport: transport,
+	}, nil
+}
+
+func (cfg Config) insecureTLS() bool {
+	if cfg.InsecureTLS == nil {
+		return true
+	}
+	return *cfg.InsecureTLS
 }
 
 type proxyHandler struct {
@@ -134,7 +172,10 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error) {
-	scheme := "https"
+	scheme, endpointHost, _, err := parseEndpoint(h.cfg.Endpoint)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid endpoint %q: %w", h.cfg.Endpoint, err)
+	}
 	bucketName := strings.TrimSpace(h.cfg.Bucket)
 
 	path := r.URL.Path
@@ -147,7 +188,7 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 	queryValues := stripAuthQueryParams(r.URL.Query())
 	targetRawQuery := queryValues.Encode()
 
-	host := h.cfg.Endpoint
+	host := endpointHost
 	if strings.Contains(bucketName, ".") {
 		// Buckets with dots can break TLS wildcard validation in virtual-host style.
 		path = ensureBucketInPath(path, bucketName)
@@ -551,15 +592,63 @@ func buildCanonicalResource(u *url.URL, bucketName string) string {
 }
 
 func buildBucketHost(bucketName, endpoint string) string {
-	parsed, err := url.Parse("//" + endpoint)
-	if err != nil || parsed.Hostname() == "" {
+	hostName, port := extractEndpointHostPort(endpoint)
+	if hostName == "" {
 		return bucketName + "." + endpoint
 	}
-	host := bucketName + "." + parsed.Hostname()
-	if parsed.Port() != "" {
-		host += ":" + parsed.Port()
+	host := bucketName + "." + hostName
+	if port != "" {
+		host += ":" + port
 	}
 	return host
+}
+
+func extractEndpointHostname(endpoint string) string {
+	host, _ := extractEndpointHostPort(endpoint)
+	if host == "" {
+		return endpoint
+	}
+	return host
+}
+
+func extractEndpointHostPort(endpoint string) (string, string) {
+	_, host, port, err := parseEndpoint(endpoint)
+	if err != nil {
+		return "", ""
+	}
+	return host, port
+}
+
+func parseEndpoint(endpoint string) (string, string, string, error) {
+	raw := strings.TrimSpace(endpoint)
+	if raw == "" {
+		return "", "", "", fmt.Errorf("empty endpoint")
+	}
+
+	parseAsURL := strings.Contains(raw, "://")
+	if !parseAsURL {
+		// Backward compatible: endpoint without scheme defaults to https.
+		raw = "https://" + raw
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", "", "", err
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return "", "", "", fmt.Errorf("unsupported scheme %q", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" {
+		return "", "", "", fmt.Errorf("missing host")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", "", "", fmt.Errorf("endpoint should not contain path")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", "", fmt.Errorf("endpoint should not contain query or fragment")
+	}
+	return scheme, parsed.Hostname(), parsed.Port(), nil
 }
 
 func removeHopByHopHeaders(h http.Header) {
