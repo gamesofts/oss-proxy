@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -117,7 +119,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cloneHeaders(r.Header, upReq.Header)
-	h.sanitizeAndSign(upReq, bodyBytes, bucketName)
+	h.sanitizeAndSign(r, upReq, bodyBytes, bucketName)
 
 	resp, err := h.client.Do(upReq)
 	if err != nil {
@@ -230,18 +232,13 @@ func stripLeadingBucket(path, bucket string) string {
 	return "/" + trimmed
 }
 
-func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketName string) {
+func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, bucketName string) {
 	removeHopByHopHeaders(req.Header)
 
 	req.Host = req.URL.Host
 	req.Header.Set("Host", req.URL.Host)
 	req.Header.Del("Authorization")
 	req.Header.Del("Date")
-	req.Header.Del("X-Oss-Date")
-	// Force V1 signing semantics even when clients send V4-specific headers.
-	req.Header.Del("X-Oss-Signature-Version")
-	req.Header.Del("X-Oss-Content-Sha256")
-	req.Header.Del("X-Oss-Additional-Headers")
 
 	if len(body) > 0 {
 		req.ContentLength = int64(len(body))
@@ -249,11 +246,96 @@ func (h *proxyHandler) sanitizeAndSign(req *http.Request, body []byte, bucketNam
 		req.ContentLength = 0
 	}
 
+	if shouldSignV4(origReq) {
+		h.signAsV4(req, bucketName)
+		return
+	}
+
+	req.Header.Del("X-Oss-Date")
+	req.Header.Del("X-Oss-Signature-Version")
+	req.Header.Del("X-Oss-Content-Sha256")
+	req.Header.Del("X-Oss-Additional-Headers")
+
 	now := time.Now().UTC()
 	date := now.Format(http.TimeFormat)
 	req.Header.Set("Date", date)
 
 	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret, bucketName)
+	req.Header.Set("Authorization", auth)
+}
+
+func shouldSignV4(origReq *http.Request) bool {
+	auth := strings.TrimSpace(origReq.Header.Get("Authorization"))
+	if strings.HasPrefix(auth, "OSS4-HMAC-SHA256") {
+		return true
+	}
+	if strings.HasPrefix(auth, "OSS ") {
+		return false
+	}
+
+	if looksLikeV4SignatureVersion(origReq.Header.Get("X-Oss-Signature-Version")) {
+		return true
+	}
+	if looksLikeV4SignatureVersion(origReq.URL.Query().Get("x-oss-signature-version")) {
+		return true
+	}
+	if origReq.URL.Query().Get("x-oss-credential") != "" || origReq.URL.Query().Get("x-oss-signature") != "" {
+		return true
+	}
+	if origReq.URL.Query().Get("OSSAccessKeyId") != "" || origReq.URL.Query().Get("Signature") != "" || origReq.URL.Query().Get("Expires") != "" {
+		return false
+	}
+
+	// Newer clients default to V4.
+	return true
+}
+
+func looksLikeV4SignatureVersion(raw string) bool {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	return v == "v4" || v == "oss4-hmac-sha256"
+}
+
+func (h *proxyHandler) signAsV4(req *http.Request, bucketName string) {
+	now := time.Now().UTC()
+	signDate := now.Format("20060102")
+	ossDate := now.Format("20060102T150405Z")
+	region := h.cfg.Region
+	if region == "" {
+		region = inferRegion(h.cfg.Endpoint)
+	}
+
+	req.Header.Del("Date")
+	req.Header.Del("X-Oss-Signature-Version")
+	req.Header.Del("X-Oss-Additional-Headers")
+	req.Header.Set("X-Oss-Date", ossDate)
+	req.Header.Set("X-Oss-Content-Sha256", "UNSIGNED-PAYLOAD")
+
+	canonicalHeaders := buildCanonicalV4Headers(req.Header)
+	canonicalRequest := strings.Join([]string{
+		req.Method,
+		buildCanonicalURI(req.URL, bucketName),
+		buildCanonicalQuery(req.URL.Query()),
+		canonicalHeaders,
+		"",
+		"UNSIGNED-PAYLOAD",
+	}, "\n")
+
+	stringToSign := strings.Join([]string{
+		"OSS4-HMAC-SHA256",
+		ossDate,
+		signDate + "/" + region + "/oss/aliyun_v4_request",
+		sha256Hex(canonicalRequest),
+	}, "\n")
+
+	signingKey := deriveV4SigningKey(h.cfg.AccessKeySecret, signDate, region)
+	sig := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+	auth := fmt.Sprintf(
+		"OSS4-HMAC-SHA256 Credential=%s/%s/%s/oss/aliyun_v4_request,Signature=%s",
+		h.cfg.AccessKeyID, signDate, region, sig,
+	)
+	if os.Getenv("OSS_PROXY_DEBUG_SIGN") == "1" {
+		log.Printf("v4 canonicalRequest:\n%s\nv4 stringToSign:\n%s\nv4 signature=%s", canonicalRequest, stringToSign, sig)
+	}
 	req.Header.Set("Authorization", auth)
 }
 
@@ -276,11 +358,123 @@ func signV1(req *http.Request, ak, sk string, bucketName string) string {
 	mac := hmac.New(sha1.New, []byte(sk))
 	_, _ = mac.Write([]byte(stringToSign))
 	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	if os.Getenv("OSS_PROXY_DEBUG_SIGN") == "1" {
+		log.Printf("v1 stringToSign:\n%s\nv1 signature=%s", stringToSign, sig)
+	}
 	return "OSS " + ak + ":" + sig
 }
 
+func buildCanonicalV4Headers(h http.Header) string {
+	keys := make([]string, 0, len(h))
+	seen := make(map[string]struct{}, len(h))
+	for k := range h {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if lk == "" {
+			continue
+		}
+		if lk == "content-type" || lk == "content-md5" || strings.HasPrefix(lk, "x-oss-") {
+			if _, ok := seen[lk]; ok {
+				continue
+			}
+			seen[lk] = struct{}{}
+			keys = append(keys, lk)
+		}
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		vals := h.Values(http.CanonicalHeaderKey(k))
+		cleanVals := make([]string, 0, len(vals))
+		for _, v := range vals {
+			cleanVals = append(cleanVals, strings.TrimSpace(v))
+		}
+		b.WriteString(k)
+		b.WriteString(":")
+		b.WriteString(strings.Join(cleanVals, ","))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func buildCanonicalURI(u *url.URL, bucketName string) string {
+	escaped := u.EscapedPath()
+	if escaped == "" {
+		escaped = "/"
+	}
+	if bucketName != "" {
+		trimmed := strings.TrimPrefix(escaped, "/")
+		if trimmed != bucketName && !strings.HasPrefix(trimmed, bucketName+"/") {
+			escaped = "/" + bucketName + escaped
+		}
+	}
+	return escaped
+}
+
+func buildCanonicalQuery(values url.Values) string {
+	if len(values) == 0 {
+		return ""
+	}
+	type pair struct {
+		k string
+		v string
+	}
+	pairs := make([]pair, 0)
+	for k, vals := range values {
+		if len(vals) == 0 {
+			pairs = append(pairs, pair{k: encodeRFC3986(k), v: ""})
+			continue
+		}
+		for _, v := range vals {
+			pairs = append(pairs, pair{k: encodeRFC3986(k), v: encodeRFC3986(v)})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k == pairs[j].k {
+			return pairs[i].v < pairs[j].v
+		}
+		return pairs[i].k < pairs[j].k
+	})
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		if p.v == "" {
+			parts = append(parts, p.k)
+			continue
+		}
+		parts = append(parts, p.k+"="+p.v)
+	}
+	return strings.Join(parts, "&")
+}
+
+func encodeRFC3986(raw string) string {
+	escaped := url.QueryEscape(raw)
+	escaped = strings.ReplaceAll(escaped, "+", "%20")
+	escaped = strings.ReplaceAll(escaped, "*", "%2A")
+	escaped = strings.ReplaceAll(escaped, "%7E", "~")
+	return escaped
+}
+
+func sha256Hex(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func hmacSHA256(key []byte, raw string) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(raw))
+	return mac.Sum(nil)
+}
+
+func deriveV4SigningKey(sk, signDate, region string) []byte {
+	kDate := hmacSHA256([]byte("aliyun_v4"+sk), signDate)
+	kRegion := hmacSHA256(kDate, region)
+	kService := hmacSHA256(kRegion, "oss")
+	return hmacSHA256(kService, "aliyun_v4_request")
+}
+
 func buildCanonicalOSSHeaders(h http.Header) string {
-	pairs := make([]string, 0)
+	keys := make([]string, 0)
+	valuesByKey := make(map[string]string)
 	for k, vals := range h {
 		lk := strings.ToLower(strings.TrimSpace(k))
 		if !strings.HasPrefix(lk, "x-oss-") {
@@ -290,13 +484,18 @@ func buildCanonicalOSSHeaders(h http.Header) string {
 		for _, v := range vals {
 			cleanVals = append(cleanVals, strings.TrimSpace(v))
 		}
-		pairs = append(pairs, lk+":"+strings.Join(cleanVals, ","))
+		keys = append(keys, lk)
+		valuesByKey[lk] = strings.Join(cleanVals, ",")
 	}
-	sort.Strings(pairs)
-	if len(pairs) == 0 {
+	sort.Strings(keys)
+	if len(keys) == 0 {
 		return ""
 	}
-	return strings.Join(pairs, "\n") + "\n"
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, k+":"+valuesByKey[k])
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 var subresourceAllowlist = map[string]struct{}{
@@ -309,6 +508,7 @@ var subresourceAllowlist = map[string]struct{}{
 	"callback": {}, "callback-var": {}, "sequential": {}, "worm": {}, "wormid": {}, "wormextend": {}, "qos": {}, "stat": {},
 	"response-content-type": {}, "response-content-language": {}, "response-expires": {}, "response-cache-control": {},
 	"response-content-disposition": {}, "response-content-encoding": {}, "x-oss-process": {},
+	"x-oss-rename": {},
 }
 
 func buildCanonicalResource(u *url.URL, bucketName string) string {
