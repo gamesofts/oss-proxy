@@ -2,16 +2,17 @@ package main
 
 import (
 	"bytes"
-	"crypto/tls"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +22,20 @@ import (
 )
 
 type Config struct {
+	ListenAddr string        `json:"listenAddr"`
+	Routes     []RouteConfig `json:"routes"`
+}
+
+type RouteConfig struct {
+	Endpoint        string `json:"endpoint"`
+	Bucket          string `json:"bucket"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"accessKeyId"`
+	AccessKeySecret string `json:"accessKeySecret"`
+	InsecureTLS     *bool  `json:"insecureSkipVerify"`
+}
+
+type legacyConfig struct {
 	ListenAddr      string `json:"listenAddr"`
 	Endpoint        string `json:"endpoint"`
 	Bucket          string `json:"bucket"`
@@ -36,24 +51,33 @@ func loadConfig() Config {
 	}
 	loadConfigFile(&cfg)
 
-	if cfg.Endpoint == "" {
-		log.Fatalf("missing required config in config.json: endpoint")
+	if len(cfg.Routes) == 0 {
+		log.Fatalf("missing required config in config.json: routes")
 	}
-	if strings.TrimSpace(cfg.Bucket) == "" {
-		log.Fatalf("missing required config in config.json: bucket")
+
+	for i := range cfg.Routes {
+		route := &cfg.Routes[i]
+		route.Bucket = strings.TrimSpace(route.Bucket)
+		if route.Endpoint == "" {
+			log.Fatalf("missing required config in config.json routes[%d]: endpoint", i)
+		}
+		if route.Bucket == "" {
+			log.Fatalf("missing required config in config.json routes[%d]: bucket", i)
+		}
+		if route.AccessKeyID == "" {
+			log.Fatalf("missing required config in config.json routes[%d]: accessKeyId", i)
+		}
+		if route.AccessKeySecret == "" {
+			log.Fatalf("missing required config in config.json routes[%d]: accessKeySecret", i)
+		}
+		if route.Region == "" {
+			route.Region = inferRegion(route.Endpoint)
+		}
+		if _, _, _, err := parseEndpoint(route.Endpoint); err != nil {
+			log.Fatalf("invalid config routes[%d] endpoint=%q: %v", i, route.Endpoint, err)
+		}
 	}
-	if cfg.AccessKeyID == "" {
-		log.Fatalf("missing required config in config.json: accessKeyId")
-	}
-	if cfg.AccessKeySecret == "" {
-		log.Fatalf("missing required config in config.json: accessKeySecret")
-	}
-	if cfg.Region == "" {
-		cfg.Region = inferRegion(cfg.Endpoint)
-	}
-	if _, _, _, err := parseEndpoint(cfg.Endpoint); err != nil {
-		log.Fatalf("invalid config endpoint=%q: %v", cfg.Endpoint, err)
-	}
+
 	return cfg
 }
 
@@ -66,6 +90,26 @@ func loadConfigFile(cfg *Config) {
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		log.Fatalf("failed to parse %s: %v", path, err)
 	}
+	if len(cfg.Routes) > 0 {
+		return
+	}
+
+	var legacy legacyConfig
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return
+	}
+	if legacy.Endpoint == "" && legacy.Bucket == "" && legacy.AccessKeyID == "" && legacy.AccessKeySecret == "" {
+		return
+	}
+	cfg.ListenAddr = legacy.ListenAddr
+	cfg.Routes = []RouteConfig{{
+		Endpoint:        legacy.Endpoint,
+		Bucket:          legacy.Bucket,
+		Region:          legacy.Region,
+		AccessKeyID:     legacy.AccessKeyID,
+		AccessKeySecret: legacy.AccessKeySecret,
+		InsecureTLS:     legacy.InsecureTLS,
+	}}
 }
 
 func inferRegion(endpoint string) string {
@@ -84,25 +128,49 @@ func inferRegion(endpoint string) string {
 func main() {
 	cfg := loadConfig()
 
-	client, err := buildHTTPClient(cfg)
-	if err != nil {
-		log.Fatalf("failed to build upstream client: %v", err)
+	routesByBucket := make(map[string]*routeEntry, len(cfg.Routes))
+	var defaultRoute *routeEntry
+
+	for _, routeCfg := range cfg.Routes {
+		client, err := buildHTTPClient(routeCfg)
+		if err != nil {
+			log.Fatalf("failed to build upstream client for bucket=%s: %v", routeCfg.Bucket, err)
+		}
+		entry := &routeEntry{
+			cfg:    routeCfg,
+			client: client,
+		}
+		bucketKey := normalizeBucketKey(routeCfg.Bucket)
+		if _, exists := routesByBucket[bucketKey]; exists {
+			log.Fatalf("duplicated bucket in config routes: %q", routeCfg.Bucket)
+		}
+		routesByBucket[bucketKey] = entry
+		if len(cfg.Routes) == 1 {
+			defaultRoute = entry
+		}
 	}
 
-	h := &proxyHandler{cfg: cfg, client: client}
+	h := &proxyHandler{
+		routesByBucket: routesByBucket,
+		defaultRoute:   defaultRoute,
+	}
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           h,
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	log.Printf("OSS proxy listening on %s, endpoint=%s", cfg.ListenAddr, cfg.Endpoint)
+	buckets := make([]string, 0, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		buckets = append(buckets, route.Bucket)
+	}
+	log.Printf("OSS proxy listening on %s, buckets=%s", cfg.ListenAddr, strings.Join(buckets, ","))
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-func buildHTTPClient(cfg Config) (*http.Client, error) {
+func buildHTTPClient(cfg RouteConfig) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	scheme, _, _, err := parseEndpoint(cfg.Endpoint)
 	if err != nil {
@@ -123,7 +191,7 @@ func buildHTTPClient(cfg Config) (*http.Client, error) {
 	}, nil
 }
 
-func (cfg Config) insecureTLS() bool {
+func (cfg RouteConfig) insecureTLS() bool {
 	if cfg.InsecureTLS == nil {
 		return true
 	}
@@ -131,7 +199,12 @@ func (cfg Config) insecureTLS() bool {
 }
 
 type proxyHandler struct {
-	cfg    Config
+	routesByBucket map[string]*routeEntry
+	defaultRoute   *routeEntry
+}
+
+type routeEntry struct {
+	cfg    RouteConfig
 	client *http.Client
 }
 
@@ -144,7 +217,13 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.Body.Close()
 
-	targetURL, bucketName, err := h.buildTargetURL(r)
+	route, bucketName, err := h.resolveRoute(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	targetURL, err := h.buildTargetURL(r, route.cfg, bucketName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -157,9 +236,9 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cloneHeaders(r.Header, upReq.Header)
-	h.sanitizeAndSign(r, upReq, bodyBytes, bucketName)
+	h.sanitizeAndSign(r, upReq, bodyBytes, route.cfg, bucketName)
 
-	resp, err := h.client.Do(upReq)
+	resp, err := route.client.Do(upReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
 		return
@@ -171,12 +250,73 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error) {
-	scheme, endpointHost, _, err := parseEndpoint(h.cfg.Endpoint)
-	if err != nil {
-		return nil, "", fmt.Errorf("invalid endpoint %q: %w", h.cfg.Endpoint, err)
+func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error) {
+	if route, bucket := h.routeFromHost(r.Host); route != nil {
+		return route, bucket, nil
 	}
-	bucketName := strings.TrimSpace(h.cfg.Bucket)
+	if route, bucket := h.routeFromPath(r.URL.Path); route != nil {
+		return route, bucket, nil
+	}
+	if h.defaultRoute != nil {
+		return h.defaultRoute, h.defaultRoute.cfg.Bucket, nil
+	}
+
+	buckets := make([]string, 0, len(h.routesByBucket))
+	for _, route := range h.routesByBucket {
+		buckets = append(buckets, route.cfg.Bucket)
+	}
+	sort.Strings(buckets)
+	return nil, "", fmt.Errorf("cannot determine bucket from request host/path, expected one of: %s", strings.Join(buckets, ","))
+}
+
+func (h *proxyHandler) routeFromHost(hostport string) (*routeEntry, string) {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return nil, ""
+	}
+	if strings.HasPrefix(host, "[") && strings.Contains(host, "]") {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			host = parsed
+		}
+	} else if strings.Count(host, ":") == 1 {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			host = parsed
+		}
+	}
+	host = normalizeBucketKey(host)
+	if route, ok := h.routesByBucket[host]; ok {
+		return route, route.cfg.Bucket
+	}
+
+	for key, route := range h.routesByBucket {
+		if strings.HasPrefix(host, key+".") {
+			return route, route.cfg.Bucket
+		}
+	}
+	return nil, ""
+}
+
+func (h *proxyHandler) routeFromPath(path string) (*routeEntry, string) {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return nil, ""
+	}
+	first, _, _ := strings.Cut(trimmed, "/")
+	if route, ok := h.routesByBucket[normalizeBucketKey(first)]; ok {
+		return route, route.cfg.Bucket
+	}
+	return nil, ""
+}
+
+func normalizeBucketKey(bucket string) string {
+	return strings.ToLower(strings.TrimSpace(bucket))
+}
+
+func (h *proxyHandler) buildTargetURL(r *http.Request, route RouteConfig, bucketName string) (*url.URL, error) {
+	scheme, endpointHost, _, err := parseEndpoint(route.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid endpoint %q: %w", route.Endpoint, err)
+	}
 
 	path := r.URL.Path
 	if path == "" {
@@ -193,7 +333,7 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		// Buckets with dots can break TLS wildcard validation in virtual-host style.
 		path = ensureBucketInPath(path, bucketName)
 	} else {
-		host = buildBucketHost(bucketName, h.cfg.Endpoint)
+		host = buildBucketHost(bucketName, route.Endpoint)
 	}
 	target := &url.URL{
 		Scheme:   scheme,
@@ -201,7 +341,7 @@ func (h *proxyHandler) buildTargetURL(r *http.Request) (*url.URL, string, error)
 		Path:     path,
 		RawQuery: targetRawQuery,
 	}
-	return target, bucketName, nil
+	return target, nil
 }
 
 func normalizePath(path string) string {
@@ -273,7 +413,7 @@ func stripLeadingBucket(path, bucket string) string {
 	return "/" + trimmed
 }
 
-func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, bucketName string) {
+func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, route RouteConfig, bucketName string) {
 	removeHopByHopHeaders(req.Header)
 
 	req.Host = req.URL.Host
@@ -288,7 +428,7 @@ func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, 
 	}
 
 	if shouldSignV4(origReq) {
-		h.signAsV4(req, bucketName)
+		h.signAsV4(req, route, bucketName)
 		return
 	}
 
@@ -301,7 +441,7 @@ func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, 
 	date := now.Format(http.TimeFormat)
 	req.Header.Set("Date", date)
 
-	auth := signV1(req, h.cfg.AccessKeyID, h.cfg.AccessKeySecret, bucketName)
+	auth := signV1(req, route.AccessKeyID, route.AccessKeySecret, bucketName)
 	req.Header.Set("Authorization", auth)
 }
 
@@ -336,13 +476,13 @@ func looksLikeV4SignatureVersion(raw string) bool {
 	return v == "v4" || v == "oss4-hmac-sha256"
 }
 
-func (h *proxyHandler) signAsV4(req *http.Request, bucketName string) {
+func (h *proxyHandler) signAsV4(req *http.Request, route RouteConfig, bucketName string) {
 	now := time.Now().UTC()
 	signDate := now.Format("20060102")
 	ossDate := now.Format("20060102T150405Z")
-	region := h.cfg.Region
+	region := route.Region
 	if region == "" {
-		region = inferRegion(h.cfg.Endpoint)
+		region = inferRegion(route.Endpoint)
 	}
 
 	req.Header.Del("Date")
@@ -368,11 +508,11 @@ func (h *proxyHandler) signAsV4(req *http.Request, bucketName string) {
 		sha256Hex(canonicalRequest),
 	}, "\n")
 
-	signingKey := deriveV4SigningKey(h.cfg.AccessKeySecret, signDate, region)
+	signingKey := deriveV4SigningKey(route.AccessKeySecret, signDate, region)
 	sig := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
 	auth := fmt.Sprintf(
 		"OSS4-HMAC-SHA256 Credential=%s/%s/%s/oss/aliyun_v4_request,Signature=%s",
-		h.cfg.AccessKeyID, signDate, region, sig,
+		route.AccessKeyID, signDate, region, sig,
 	)
 	if os.Getenv("OSS_PROXY_DEBUG_SIGN") == "1" {
 		log.Printf("v4 canonicalRequest:\n%s\nv4 stringToSign:\n%s\nv4 signature=%s", canonicalRequest, stringToSign, sig)

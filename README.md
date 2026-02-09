@@ -7,6 +7,7 @@
 - 透明转发任意 OSS HTTP API（路径、方法、查询参数、请求体都保持原样）
 - 使用代理服务器时间重建 `Date` 与 `Authorization`
 - 支持透传 `x-oss-*` 头并纳入签名
+- 支持多 bucket 路由：同一代理可按 bucket 使用不同 `endpoint/region/ak/sk`
 
 ## 运行
 
@@ -14,11 +15,22 @@
 cat > config.json <<'JSON'
 {
   "listenAddr": ":8080",
-  "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
-  "region": "cn-hangzhou",
-  "accessKeyId": "your-ak",
-  "accessKeySecret": "your-sk",
-  "bucket": "your-bucket"
+  "routes": [
+    {
+      "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
+      "region": "cn-shanghai",
+      "accessKeyId": "your-ak-1",
+      "accessKeySecret": "your-sk-1",
+      "bucket": "bucket-a"
+    },
+    {
+      "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+      "region": "cn-hangzhou",
+      "accessKeyId": "your-ak-2",
+      "accessKeySecret": "your-sk-2",
+      "bucket": "bucket-b"
+    }
+  ]
 }
 JSON
 
@@ -27,7 +39,7 @@ go run .
 
 ## 使用方式
 
-- 原：`https://oss-cn-hangzhou.aliyuncs.com/your-bucket/key`
-- 新：`http://proxy-host:8080/key`（或 `http://proxy-host:8080/your-bucket/key`）
+- 多 bucket 时：`http://proxy-host:8080/<bucket>/key`
+- 单 bucket 时：仍兼容 `http://proxy-host:8080/key` 与 `http://proxy-host:8080/<bucket>/key`
 
-代理会自动重建签名并转发到 `endpoint`。
+代理会根据 bucket 自动选择对应路由并重建签名后转发。
