@@ -467,8 +467,8 @@ func shouldSignV4(origReq *http.Request) bool {
 		return false
 	}
 
-	// Newer clients default to V4.
-	return true
+	// For unsigned browser/direct-link requests, prefer V1 for broader OSS compatibility.
+	return false
 }
 
 func looksLikeV4SignatureVersion(raw string) bool {
