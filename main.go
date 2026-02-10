@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -217,13 +216,6 @@ type routeEntry struct {
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-	_ = r.Body.Close()
-
 	route, bucketName, err := h.resolveRoute(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -236,14 +228,15 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), bytes.NewReader(bodyBytes))
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
 		return
 	}
+	upReq.ContentLength = r.ContentLength
 
 	cloneHeaders(r.Header, upReq.Header)
-	h.sanitizeAndSign(r, upReq, bodyBytes, route.cfg, bucketName)
+	h.sanitizeAndSign(r, upReq, route.cfg, bucketName)
 
 	resp, err := route.client.Do(upReq)
 	if err != nil {
@@ -275,7 +268,6 @@ func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error
 	for _, route := range h.routesByBucket {
 		buckets = append(buckets, route.cfg.Bucket)
 	}
-	sort.Strings(buckets)
 	return nil, "", fmt.Errorf("cannot determine bucket from request host/path, expected one of: %s", strings.Join(buckets, ","))
 }
 
@@ -354,8 +346,9 @@ func parseAccessKeyIDFromAuthorization(auth string) string {
 		return ""
 	}
 
-	if strings.HasPrefix(raw, "OSS ") {
-		cred := strings.TrimSpace(strings.TrimPrefix(raw, "OSS "))
+	rawLower := strings.ToLower(raw)
+	if strings.HasPrefix(rawLower, "oss ") {
+		cred := strings.TrimSpace(raw[4:])
 		accessKeyID, _, ok := strings.Cut(cred, ":")
 		if !ok {
 			return ""
@@ -363,12 +356,12 @@ func parseAccessKeyIDFromAuthorization(auth string) string {
 		return strings.TrimSpace(accessKeyID)
 	}
 
-	if strings.HasPrefix(raw, "OSS4-HMAC-SHA256") {
-		idx := strings.Index(raw, "Credential=")
+	if strings.HasPrefix(rawLower, "oss4-hmac-sha256") {
+		idx := strings.Index(rawLower, "credential=")
 		if idx < 0 {
 			return ""
 		}
-		credentialPart := raw[idx+len("Credential="):]
+		credentialPart := raw[idx+len("credential="):]
 		credentialPart, _, _ = strings.Cut(credentialPart, ",")
 		credentialPart = strings.TrimSpace(credentialPart)
 		accessKeyID, _, _ := strings.Cut(credentialPart, "/")
@@ -479,19 +472,13 @@ func stripLeadingBucket(path, bucket string) string {
 	return "/" + trimmed
 }
 
-func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, body []byte, route RouteConfig, bucketName string) {
+func (h *proxyHandler) sanitizeAndSign(origReq, req *http.Request, route RouteConfig, bucketName string) {
 	removeHopByHopHeaders(req.Header)
 
 	req.Host = req.URL.Host
 	req.Header.Set("Host", req.URL.Host)
 	req.Header.Del("Authorization")
 	req.Header.Del("Date")
-
-	if len(body) > 0 {
-		req.ContentLength = int64(len(body))
-	} else {
-		req.ContentLength = 0
-	}
 
 	if shouldSignV4(origReq) {
 		h.signAsV4(req, route, bucketName)
