@@ -129,6 +129,7 @@ func main() {
 	cfg := loadConfig()
 
 	routesByBucket := make(map[string]*routeEntry, len(cfg.Routes))
+	routesByAccessKeyID := make(map[string][]*routeEntry, len(cfg.Routes))
 	var defaultRoute *routeEntry
 
 	for _, routeCfg := range cfg.Routes {
@@ -145,14 +146,19 @@ func main() {
 			log.Fatalf("duplicated bucket in config routes: %q", routeCfg.Bucket)
 		}
 		routesByBucket[bucketKey] = entry
+		accessKeyID := normalizeAccessKeyID(routeCfg.AccessKeyID)
+		if accessKeyID != "" {
+			routesByAccessKeyID[accessKeyID] = append(routesByAccessKeyID[accessKeyID], entry)
+		}
 		if len(cfg.Routes) == 1 {
 			defaultRoute = entry
 		}
 	}
 
 	h := &proxyHandler{
-		routesByBucket: routesByBucket,
-		defaultRoute:   defaultRoute,
+		routesByBucket:      routesByBucket,
+		routesByAccessKeyID: routesByAccessKeyID,
+		defaultRoute:        defaultRoute,
 	}
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -199,8 +205,9 @@ func (cfg RouteConfig) insecureTLS() bool {
 }
 
 type proxyHandler struct {
-	routesByBucket map[string]*routeEntry
-	defaultRoute   *routeEntry
+	routesByBucket      map[string]*routeEntry
+	routesByAccessKeyID map[string][]*routeEntry
+	defaultRoute        *routeEntry
 }
 
 type routeEntry struct {
@@ -257,6 +264,9 @@ func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error
 	if route, bucket := h.routeFromPath(r.URL.Path); route != nil {
 		return route, bucket, nil
 	}
+	if route, bucket, err := h.routeFromAuthorization(r.Header.Get("Authorization")); route != nil || err != nil {
+		return route, bucket, err
+	}
 	if h.defaultRoute != nil {
 		return h.defaultRoute, h.defaultRoute.cfg.Bucket, nil
 	}
@@ -267,6 +277,28 @@ func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error
 	}
 	sort.Strings(buckets)
 	return nil, "", fmt.Errorf("cannot determine bucket from request host/path, expected one of: %s", strings.Join(buckets, ","))
+}
+
+func (h *proxyHandler) routeFromAuthorization(authHeader string) (*routeEntry, string, error) {
+	accessKeyID := parseAccessKeyIDFromAuthorization(authHeader)
+	if accessKeyID == "" {
+		return nil, "", nil
+	}
+
+	routes := h.routesByAccessKeyID[normalizeAccessKeyID(accessKeyID)]
+	switch len(routes) {
+	case 0:
+		return nil, "", nil
+	case 1:
+		return routes[0], routes[0].cfg.Bucket, nil
+	default:
+		buckets := make([]string, 0, len(routes))
+		for _, route := range routes {
+			buckets = append(buckets, route.cfg.Bucket)
+		}
+		sort.Strings(buckets)
+		return nil, "", fmt.Errorf("cannot determine bucket from Authorization accessKeyId=%s, expected one of: %s", accessKeyID, strings.Join(buckets, ","))
+	}
 }
 
 func (h *proxyHandler) routeFromHost(hostport string) (*routeEntry, string) {
@@ -310,6 +342,40 @@ func (h *proxyHandler) routeFromPath(path string) (*routeEntry, string) {
 
 func normalizeBucketKey(bucket string) string {
 	return strings.ToLower(strings.TrimSpace(bucket))
+}
+
+func normalizeAccessKeyID(accessKeyID string) string {
+	return strings.TrimSpace(accessKeyID)
+}
+
+func parseAccessKeyIDFromAuthorization(auth string) string {
+	raw := strings.TrimSpace(auth)
+	if raw == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(raw, "OSS ") {
+		cred := strings.TrimSpace(strings.TrimPrefix(raw, "OSS "))
+		accessKeyID, _, ok := strings.Cut(cred, ":")
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(accessKeyID)
+	}
+
+	if strings.HasPrefix(raw, "OSS4-HMAC-SHA256") {
+		idx := strings.Index(raw, "Credential=")
+		if idx < 0 {
+			return ""
+		}
+		credentialPart := raw[idx+len("Credential="):]
+		credentialPart, _, _ = strings.Cut(credentialPart, ",")
+		credentialPart = strings.TrimSpace(credentialPart)
+		accessKeyID, _, _ := strings.Cut(credentialPart, "/")
+		return strings.TrimSpace(accessKeyID)
+	}
+
+	return ""
 }
 
 func (h *proxyHandler) buildTargetURL(r *http.Request, route RouteConfig, bucketName string) (*url.URL, error) {
