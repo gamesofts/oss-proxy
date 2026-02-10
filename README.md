@@ -1,4 +1,4 @@
-# OSS Reverse Proxy
+# Aliyun OSS 代理
 
 一个用于阿里云 OSS 的反向代理服务。它接收客户端请求后，使用代理机当前时间重新签名，再转发到 OSS，从而规避客户端机器时间漂移（例如跨年测试）带来的签名失效问题。
 
@@ -39,7 +39,4 @@ go run .
 
 ## 使用方式
 
-- 多 bucket 时：`http://proxy-host:8080/<bucket>/key`
-- 单 bucket 时：仍兼容 `http://proxy-host:8080/key` 与 `http://proxy-host:8080/<bucket>/key`
-
-代理会根据 bucket 自动选择对应路由并重建签名后转发。
+修改客户端 endpoint 到代理服务器：`http://proxy-host:8080`
