@@ -218,18 +218,21 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	route, bucketName, err := h.resolveRoute(r)
 	if err != nil {
+		logRequestError("route resolve failed", err, r)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	targetURL, err := h.buildTargetURL(r, route.cfg, bucketName)
 	if err != nil {
+		logRequestError("build target url failed", err, r)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	upReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
 	if err != nil {
+		logRequestError("build upstream request failed", err, r)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
 		return
 	}
@@ -240,6 +243,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := route.client.Do(upReq)
 	if err != nil {
+		logRequestError("upstream request failed", err, r)
 		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -250,6 +254,38 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func logRequestError(prefix string, err error, r *http.Request) {
+	if r == nil {
+		log.Printf("%s: %v", prefix, err)
+		return
+	}
+
+	requestURI := r.RequestURI
+	path := ""
+	rawQuery := ""
+	rawURL := ""
+	if r.URL != nil {
+		path = r.URL.Path
+		rawQuery = r.URL.RawQuery
+		rawURL = r.URL.String()
+	}
+
+	log.Printf(
+		"%s: %v: method=%s host=%q request_uri=%q path=%q raw_query=%q remote_addr=%q proto=%q url=%q headers=%v",
+		prefix,
+		err,
+		r.Method,
+		r.Host,
+		requestURI,
+		path,
+		rawQuery,
+		r.RemoteAddr,
+		r.Proto,
+		rawURL,
+		r.Header,
+	)
+}
+
 func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error) {
 	if route, bucket := h.routeFromHost(r.Host); route != nil {
 		return route, bucket, nil
@@ -257,18 +293,26 @@ func (h *proxyHandler) resolveRoute(r *http.Request) (*routeEntry, string, error
 	if route, bucket := h.routeFromPath(r.URL.Path); route != nil {
 		return route, bucket, nil
 	}
-	if route, bucket, err := h.routeFromAuthorization(r.Header.Get("Authorization")); route != nil || err != nil {
-		return route, bucket, err
+	if route, bucket, _ := h.routeFromAuthorization(r.Header.Get("Authorization")); route != nil {
+		return route, bucket, nil
 	}
 	if h.defaultRoute != nil {
 		return h.defaultRoute, h.defaultRoute.cfg.Bucket, nil
 	}
 
-	buckets := make([]string, 0, len(h.routesByBucket))
-	for _, route := range h.routesByBucket {
-		buckets = append(buckets, route.cfg.Bucket)
+	if bucket := bucketFromPathCandidate(r.URL.Path); bucket != "" {
+		if _, ok := h.routesByBucket[normalizeBucketKey(bucket)]; !ok {
+			return nil, "", fmt.Errorf("bucket %q recognized from request path but not found in config", bucket)
+		}
 	}
-	return nil, "", fmt.Errorf("cannot determine bucket from request host/path, expected one of: %s", strings.Join(buckets, ","))
+
+	if bucket := bucketFromHostCandidate(r.Host); bucket != "" {
+		if _, ok := h.routesByBucket[normalizeBucketKey(bucket)]; !ok {
+			return nil, "", fmt.Errorf("bucket %q recognized from request host but not found in config", bucket)
+		}
+	}
+
+	return nil, "", fmt.Errorf("cannot determine bucket from request host/path/auth")
 }
 
 func (h *proxyHandler) routeFromAuthorization(authHeader string) (*routeEntry, string, error) {
@@ -321,15 +365,87 @@ func (h *proxyHandler) routeFromHost(hostport string) (*routeEntry, string) {
 }
 
 func (h *proxyHandler) routeFromPath(path string) (*routeEntry, string) {
-	trimmed := strings.TrimPrefix(path, "/")
-	if trimmed == "" {
+	bucket := bucketFromPathCandidate(path)
+	if bucket == "" {
 		return nil, ""
 	}
-	first, _, _ := strings.Cut(trimmed, "/")
-	if route, ok := h.routesByBucket[normalizeBucketKey(first)]; ok {
+	if route, ok := h.routesByBucket[normalizeBucketKey(bucket)]; ok {
 		return route, route.cfg.Bucket
 	}
 	return nil, ""
+}
+
+func bucketFromPathCandidate(path string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return ""
+	}
+	first, _, _ := strings.Cut(trimmed, "/")
+	first = strings.TrimSpace(first)
+	if !isLikelyBucketName(first) {
+		return ""
+	}
+	return first
+}
+
+func bucketFromHostCandidate(hostport string) string {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") && strings.Contains(host, "]") {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			host = parsed
+		}
+	} else if strings.Count(host, ":") == 1 {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			host = parsed
+		}
+	}
+
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+
+	host = normalizeBucketKey(host)
+	if host == "" {
+		return ""
+	}
+
+	if strings.Contains(host, ".") {
+		first, _, _ := strings.Cut(host, ".")
+		first = strings.TrimSpace(first)
+		if !isLikelyBucketName(first) {
+			return ""
+		}
+		return first
+	}
+	if !isLikelyBucketName(host) {
+		return ""
+	}
+	return host
+}
+
+func isLikelyBucketName(name string) bool {
+	if len(name) < 3 || len(name) > 63 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	first := name[0]
+	last := name[len(name)-1]
+	if !((first >= 'a' && first <= 'z') || (first >= '0' && first <= '9')) {
+		return false
+	}
+	if !((last >= 'a' && last <= 'z') || (last >= '0' && last <= '9')) {
+		return false
+	}
+	return true
 }
 
 func normalizeBucketKey(bucket string) string {
