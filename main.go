@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -248,6 +250,14 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		respBody, readErr := readAndRestoreBody(resp)
+		if readErr != nil {
+			logRequestError("read upstream error body failed", readErr, r)
+		}
+		logUpstreamHTTPError(resp, respBody, 64*1024, r, targetURL)
+	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -983,4 +993,82 @@ func copyResponseHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+type ossErrorResponse struct {
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
+	RequestID string `xml:"RequestId"`
+	HostID    string `xml:"HostId"`
+	EC        string `xml:"EC"`
+}
+
+func readAndRestoreBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	return body, nil
+}
+
+func logUpstreamHTTPError(resp *http.Response, body []byte, maxLoggedBytes int, req *http.Request, targetURL *url.URL) {
+	if resp == nil {
+		return
+	}
+
+	snippetBody := body
+	truncated := false
+	if len(snippetBody) > maxLoggedBytes {
+		snippetBody = snippetBody[:maxLoggedBytes]
+		truncated = true
+	}
+	snippet := strings.TrimSpace(string(snippetBody))
+	if snippet == "" {
+		snippet = "<empty>"
+	}
+
+	parsedErr := parseOSSErrorBody(body)
+	target := ""
+	if targetURL != nil {
+		target = targetURL.String()
+	}
+
+	log.Printf(
+		"upstream returned error: status=%d status_text=%q content_type=%q x_oss_request_id=%q x_oss_ec=%q parsed_code=%q parsed_message=%q parsed_request_id=%q parsed_host_id=%q parsed_ec=%q truncated=%t target_url=%q method=%s host=%q request_uri=%q remote_addr=%q body=%q",
+		resp.StatusCode,
+		resp.Status,
+		resp.Header.Get("Content-Type"),
+		resp.Header.Get("x-oss-request-id"),
+		resp.Header.Get("x-oss-ec"),
+		parsedErr.Code,
+		parsedErr.Message,
+		parsedErr.RequestID,
+		parsedErr.HostID,
+		parsedErr.EC,
+		truncated,
+		target,
+		req.Method,
+		req.Host,
+		req.RequestURI,
+		req.RemoteAddr,
+		snippet,
+	)
+}
+
+func parseOSSErrorBody(body []byte) ossErrorResponse {
+	var parsed ossErrorResponse
+	if len(bytes.TrimSpace(body)) == 0 {
+		return parsed
+	}
+	if err := xml.Unmarshal(body, &parsed); err != nil {
+		return ossErrorResponse{}
+	}
+	return parsed
 }
