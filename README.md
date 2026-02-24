@@ -8,6 +8,7 @@
 - 使用代理服务器时间重建 `Date` 与 `Authorization`
 - 支持透传 `x-oss-*` 头并纳入签名
 - 支持多 bucket 路由：同一代理可按 bucket 使用不同 `endpoint/region/ak/sk`
+- 可选日志级别模式：`debug` / `info` / `error` / `none`
 
 ## 运行
 
@@ -15,6 +16,7 @@
 cat > config.json <<'JSON'
 {
   "listenAddr": ":8080",
+  "logMode": "info",
   "routes": [
     {
       "endpoint": "https://oss-cn-shanghai.aliyuncs.com",
