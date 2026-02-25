@@ -308,6 +308,7 @@ type routeEntry struct {
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	start := time.Now()
+	isObjectMetaReq := isObjectMetaRequest(r)
 	h.logRequestDebug("incoming request", r)
 	route, bucketName, err := h.resolveRoute(r)
 	if err != nil {
@@ -323,15 +324,27 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
+	upstreamMethod := r.Method
+	var upstreamBody io.Reader = r.Body
+	if isObjectMetaReq && r.Method == http.MethodGet {
+		upstreamMethod = http.MethodHead
+		upstreamBody = nil
+	}
+	upReq, err := http.NewRequestWithContext(ctx, upstreamMethod, targetURL.String(), upstreamBody)
 	if err != nil {
 		h.logRequestError("build upstream request failed", err, r)
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
 		return
 	}
 	upReq.ContentLength = r.ContentLength
+	if isObjectMetaReq && upstreamMethod == http.MethodHead {
+		upReq.ContentLength = 0
+	}
 
 	cloneHeaders(r.Header, upReq.Header)
+	if isObjectMetaReq && upstreamMethod == http.MethodHead {
+		upReq.Header.Del("Content-Length")
+	}
 	h.sanitizeAndSign(r, upReq, route, bucketName)
 
 	resp, err := route.client.Do(upReq)
@@ -343,7 +356,16 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)
+	if isObjectMetaReq && r.Method != http.MethodHead {
+		normalizeObjectMetaGETResponseHeaders(w.Header())
+	}
 	w.WriteHeader(resp.StatusCode)
+	if isObjectMetaReq {
+		// GetObjectMeta returns metadata headers only. Its Content-Length is object size metadata,
+		// not a response body length we should read, otherwise the proxy can block and hit EOF later.
+		h.logRequestSummary(r, resp.StatusCode, 0, start, targetURL)
+		return
+	}
 	if resp.StatusCode < http.StatusBadRequest {
 		n, copyErr := h.copyResponseBody(w, resp.Body)
 		if copyErr != nil {
@@ -790,6 +812,28 @@ func stripAuthQueryParams(values url.Values) url.Values {
 		filtered[k] = append([]string(nil), v...)
 	}
 	return filtered
+}
+
+func isObjectMetaRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	_, ok := r.URL.Query()["objectMeta"]
+	return ok
+}
+
+func normalizeObjectMetaGETResponseHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+	if size := h.Get("Content-Length"); size != "" {
+		// For GET compatibility we return a valid empty response body, so downstream Content-Length
+		// cannot keep OSS object-size metadata value. Preserve it in a separate header.
+		if h.Get("X-Oss-Object-Size") == "" {
+			h.Set("X-Oss-Object-Size", size)
+		}
+		h.Del("Content-Length")
+	}
 }
 
 func isAuthQueryParam(key string) bool {
